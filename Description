@@ -1,0 +1,113 @@
+ПРОЕКТ: Switch Menu
+
+КРАТКОЕ ОПИСАНИЕ:
+Десктопное приложение на Python/Tkinter для управления коллекцией игр Nintendo Switch. Сканирует папку с играми, показывает обложку, скриншоты (слайд-шоу) и описание для каждой игры.
+
+ТЕХНОЛОГИИ: Python 3.12+, Tkinter, Pillow, PyInstaller
+
+=== СТРУКТУРА ПРОЕКТА ===
+
+Файлы:
+- switch_menu.py - главный файл (весь код)
+- resources.py - вшитые ресурсы (генерируется отдельным скриптом)
+- icon.ico, Z.jpg, fon.jpg - исходники для вшивания
+- menu.ini - настройки (создаётся автоматически в папке пользователя)
+
+=== ОСНОВНЫЕ КОМПОНЕНТЫ КОДА ===
+
+1. ИНИЦИАЛИЗАЦИЯ (__init__):
+   - Загрузка настроек из menu.ini
+   - Загрузка вшитых ресурсов (иконка, фон)
+   - Создание Canvas для фона
+   - Вызов create_widgets()
+   - Запуск auto_start() через 500 мс
+
+2. UI (create_widgets):
+   Левая панель (35%):
+   - count_label - счётчик игр
+   - legend_frame - легенда с подсказкой
+   - list_canvas + scrollable_frame - список игр
+   Каждая игра:
+   - Три индикатора (create_indicator) с цветами:
+     * #4a8af4 - описание → edit_description()
+     * #4aca4a - обложка → choose_cover()
+     * #e8a830 - геймплей → add_gameplay()
+   - name_label - название игры
+
+   Правая панель (65%):
+   - game_title_label - название (с бегущей строкой)
+   - open_folder_btn - кнопка открытия папки
+   - cover_label - обложка
+   - gameplay_label - слайд-шоу
+   - desc_text - текстовое описание
+   - desc_status_label - статус описания
+
+3. РАБОТА С ФАЙЛАМИ (find_game_files):
+   Ищет в папке игры:
+   - Description.txt (описание)
+   - cover.* (обложка, любой формат)
+   - game*. * (скриншоты, любые форматы)
+
+4. ОТОБРАЖЕНИЕ ИГРЫ (show_game_description):
+   - Останавливает старую анимацию (stop_title_scroll)
+   - Показывает название (запускает бегущую строку при длине >25)
+   - Показывает обложку (cover_label)
+   - Показывает слайд-шоу (gameplay_label)
+   - Показывает описание (desc_text)
+   - Активирует кнопку "Открыть папку"
+
+5. СЛАЙД-ШОУ:
+   - start_slideshow() - запускает
+   - next_slide() - следующий кадр
+   - stop_slideshow() - останавливает
+   - show_gameplay_at_index() - показывает конкретный кадр
+   - При наведении - пауза (on_gameplay_enter/leave)
+   - Колёсико мыши - ручное перелистывание (on_gameplay_scroll)
+
+6. РЕДАКТИРОВАНИЕ:
+   - edit_description() - открывает окно с Text для редактирования
+   - choose_cover() - диалог выбора файла для обложки
+   - add_gameplay() - диалог выбора файла для скриншота
+
+7. БЕГУЩАЯ СТРОКА:
+   - start_title_scroll() - запускает
+   - scroll_title() - анимирует (каждые 200 мс)
+   - stop_title_scroll() - останавливает
+
+8. НАСТРОЙКИ (show_settings):
+   - Окно с выбором папки
+   - Авто-сканирование (чекбокс)
+   - Частота слайд-шоу (поле ввода)
+   - Кнопка "Об авторе"
+
+9. АВТОЗАПУСК (auto_start):
+   - Проверяет auto_scan в настройках
+   - Ищет папку Switch рядом с программой
+   - Или использует last_path из настроек
+
+=== КЛЮЧЕВЫЕ ПЕРЕМЕННЫЕ ===
+
+self.switch_path - путь к папке с играми
+self.games - список названий игр
+self.current_game - текущая выбранная игра
+self.current_desc_path - путь к Description.txt
+self.current_cover_path - путь к обложке
+self.current_gameplay_paths - список путей к скриншотам
+self.slide_interval - интервал слайд-шоу (мс)
+
+=== ЗАВИСИМОСТИ ===
+
+pip install pillow python-docx
+
+=== СБОРКА .EXE ===
+
+pyinstaller --onefile --windowed --name "SwitchMenu" --icon="icon.ico" switch_menu.py
+
+=== ПЕРЕНОС НА ДРУГИЕ ОС ===
+
+Заменить os.startfile() на:
+- macOS: subprocess.Popen(['open', path])
+- Linux: subprocess.Popen(['xdg-open', path])
+
+Убрать:
+- ctypes.windll.kernel32.SetFileAttributesW (скрытие файлов)
