@@ -11,12 +11,20 @@ from resources import get_icon_path, get_photo_path, get_background_path
 
 # ПРОВЕРКА БИБЛИОТЕК
 try:
-    from PIL import Image, ImageTk
+    from PIL import Image, ImageTk, ImageDraw
     HAS_PIL = True
     print("✅ Pillow загружен")
 except ImportError as e:
     HAS_PIL = False
     print(f"❌ Pillow НЕ загружен: {e}")
+
+try:
+    import cv2
+    HAS_CV2 = True
+    print("✅ OpenCV загружен (превью видео и проигрывание)")
+except ImportError:
+    HAS_CV2 = False
+    print("⚠️ OpenCV не найден — видео не будет проигрываться")
 
 try:
     from docx import Document
@@ -26,8 +34,9 @@ except ImportError as e:
     HAS_DOCX = False
     print(f"❌ python-docx НЕ загружен: {e}")
 
-# Поддерживаемые форматы изображений
+# Поддерживаемые форматы изображений и видео
 IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.tif', '.webp', '.ico')
+VIDEO_EXTENSIONS = ('.mp4', '.mkv', '.avi', '.mov', '.webm', '.wmv', '.m4v')
 
 
 class SwitchMenu:
@@ -65,21 +74,47 @@ class SwitchMenu:
         self.games = []
         self.current_game = None
         self.current_desc_path = None
-        self.current_cover_path = None
-        self.current_gameplay_paths = []
         
-        # Для геймплея (слайд-шоу)
-        self.gameplay_images = []
-        self.gameplay_index = 0
-        self.slide_timer = None
-        self.is_sliding = False
-        self.is_hovering_gameplay = False
+        # Медиа (обложки и геймплей)
+        self.current_media = {'cover': [], 'gameplay': []}
+        self._displayed_media_path = {'cover': None, 'gameplay': None}
+        self.slides = {
+            'cover':    {'index': 0, 'timer': None, 'is_sliding': False, 'is_hovering': False},
+            'gameplay': {'index': 0, 'timer': None, 'is_sliding': False, 'is_hovering': False},
+        }
         self.slide_interval = self.config.getint('Settings', 'slide_interval', fallback=3000)
+        self.play_video_full = self.config.getboolean('Settings', 'play_video_full', fallback=False)
         
         # Для бегущей строки
         self.title_scroll_timer = None
         self.title_scroll_text = None
         self.title_scroll_pos = 0
+        
+        # Для отложенного обновления правой панели
+        self._update_job = None
+        
+        # Для навигации с клавиатуры
+        self.selected_index = -1
+        
+        # --- ВИДЕО ПЛЕЕРЫ ---
+        self.video_players = {
+            'cover': {
+                'cap': None,
+                'timer': None,
+                'running': False,
+                'current_path': None,
+                'delay': 30,
+                'label': None,
+            },
+            'gameplay': {
+                'cap': None,
+                'timer': None,
+                'running': False,
+                'current_path': None,
+                'delay': 30,
+                'label': None,
+            }
+        }
         
         # Canvas для фона
         self.canvas = tk.Canvas(self.root, highlightthickness=0, bg='#1a1a2e')
@@ -89,16 +124,231 @@ class SwitchMenu:
         # Создаём виджеты поверх Canvas
         self.create_widgets()
         
+        # Сохраняем ссылки на label'ы в плеерах
+        self.video_players['cover']['label'] = self.cover_label
+        self.video_players['gameplay']['label'] = self.gameplay_label
+        
         # Статус библиотек
         status = "✅" if HAS_DOCX and HAS_PIL else "⚠️"
         self.status_label.config(text=f"{status} docx: {HAS_DOCX}, PIL: {HAS_PIL}")
+        
+        # Привязываем клавиши навигации
+        self.root.bind('<Up>', self.on_key_up)
+        self.root.bind('<Down>', self.on_key_down)
+        self.root.focus_set()
         
         # Запускаем сканирование
         self.root.after(500, self.auto_start)
         
         # Привязываем событие изменения размера окна
         self.root.bind('<Configure>', self.on_resize)
+        self._layout_resize_job = None
+        self.canvas.bind('<Configure>', self.on_layout_resize)
+        
+        # При закрытии окна чистим плееры
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
     
+    def on_closing(self):
+        self._stop_all_video()
+        self.root.destroy()
+    
+    # ------------------------------------------------------------
+    # НАВИГАЦИЯ С КЛАВИАТУРЫ
+    # ------------------------------------------------------------
+    def on_key_up(self, event):
+        if self.games:
+            new_idx = max(0, self.selected_index - 1)
+            if new_idx != self.selected_index:
+                self.select_game(new_idx)
+        return "break"
+    
+    def on_key_down(self, event):
+        if self.games:
+            new_idx = min(len(self.games) - 1, self.selected_index + 1)
+            if new_idx != self.selected_index:
+                self.select_game(new_idx)
+        return "break"
+    
+    def select_game(self, index):
+        if 0 <= index < len(self.games):
+            self.selected_index = index
+            game = self.games[index]
+            game_path = os.path.join(self.switch_path, game)
+            desc_file, cover_media, gameplay_media = self.find_game_files(game_path)
+            self.highlight_game(game)
+            self.scroll_to_index(index)
+            self.show_game_description(game, desc_file, cover_media, gameplay_media, delay=300)
+    
+    def scroll_to_index(self, index):
+        children = self.scrollable_frame.winfo_children()
+        if not children or index < 0 or index >= len(children):
+            return
+        frame = children[index]
+        self.scrollable_frame.update_idletasks()
+        y = frame.winfo_y()
+        height = frame.winfo_height()
+        canvas_height = self.list_canvas.winfo_height()
+        margin = 10
+        visible_top = self.list_canvas.canvasy(0)
+        visible_bottom = visible_top + canvas_height
+        if visible_top + margin <= y and y + height <= visible_bottom - margin:
+            return
+        total_height = self.scrollable_frame.winfo_height()
+        if total_height <= canvas_height:
+            self.list_canvas.yview_moveto(0)
+            return
+        if y < visible_top + margin:
+            fraction = (y - margin) / (total_height - canvas_height)
+        else:
+            fraction = (y + height - canvas_height + margin) / (total_height - canvas_height)
+        fraction = max(0.0, min(1.0, fraction))
+        self.list_canvas.yview_moveto(fraction)
+    
+    # ------------------------------------------------------------
+    # ВИДЕО ПЛЕЙБЕК (автопроигрывание без звука)
+    # ------------------------------------------------------------
+    def _stop_video_playback(self, role):
+        player = self.video_players.get(role)
+        if not player:
+            return
+        player['running'] = False
+        if player['timer']:
+            self.root.after_cancel(player['timer'])
+            player['timer'] = None
+        if player['cap'] is not None:
+            player['cap'].release()
+            player['cap'] = None
+        player['current_path'] = None
+
+    def _stop_all_video(self):
+        for role in ('cover', 'gameplay'):
+            self._stop_video_playback(role)
+
+    def _start_video_playback(self, role, file_path):
+        if not HAS_CV2:
+            self._show_video_placeholder(role, file_path)
+            return
+
+        self._stop_video_playback(role)
+        player = self.video_players[role]
+        label = player['label']
+
+        cap = cv2.VideoCapture(file_path)
+        if not cap.isOpened():
+            label.config(text="❌ Видео не открыть", image='', fg='#ff6666')
+            label.image = None
+            player['current_path'] = None
+            return
+
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        if fps <= 0:
+            fps = 30
+        delay = int(1000 / fps)
+
+        player['cap'] = cap
+        player['running'] = True
+        player['current_path'] = file_path
+        player['delay'] = delay
+
+        self._update_video_frame(role)
+
+    def _update_video_frame(self, role):
+        player = self.video_players.get(role)
+        if not player or not player['running']:
+            return
+
+        cap = player['cap']
+        if cap is None:
+            return
+
+        ret, frame = cap.read()
+        if not ret:
+            if self.play_video_full:
+                self._stop_video_playback(role)
+                st = self.slides.get(role)
+                if st and st['is_sliding'] and not st['is_hovering']:
+                    self.next_slide(role)
+                return
+            else:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ret, frame = cap.read()
+                if not ret:
+                    self._stop_video_playback(role)
+                    player['label'].config(text="❌ Ошибка видео", image='', fg='#ff6666')
+                    player['label'].image = None
+                    return
+
+        try:
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            img = Image.fromarray(frame_rgb)
+        except Exception as e:
+            print(f"Ошибка конвертации кадра: {e}")
+            self._stop_video_playback(role)
+            player['label'].config(text="❌ Ошибка кадра", image='', fg='#ff6666')
+            player['label'].image = None
+            return
+
+        max_w, max_h = 250, 200
+        img.thumbnail((max_w, max_h), Image.Resampling.LANCZOS)
+
+        try:
+            photo = ImageTk.PhotoImage(img)
+        except Exception as e:
+            print(f"Ошибка создания PhotoImage: {e}")
+            self._stop_video_playback(role)
+            player['label'].config(text="❌ Ошибка отображения", image='', fg='#ff6666')
+            player['label'].image = None
+            return
+
+        label = player['label']
+        label.config(image=photo, text='', fg='#ffffff')
+        label.image = photo
+
+        if player['running']:
+            player['timer'] = self.root.after(player['delay'], self._update_video_frame, role)
+
+    def _show_video_placeholder(self, role, file_path):
+        player = self.video_players[role]
+        label = player['label']
+        name = os.path.basename(file_path)
+        label.config(text=f"🎬 {name}\n(клик — открыть)", image='', fg='#cccccc')
+        label.image = None
+        player['current_path'] = file_path
+
+    def render_media(self, role, item):
+        label = self.cover_label if role == 'cover' else self.gameplay_label
+        empty_text = "Обложка отсутствует" if role == 'cover' else "Геймплей отсутствует"
+
+        self._stop_video_playback(role)
+
+        if not item:
+            label.config(text=empty_text, image='', fg='#888888')
+            label.image = None
+            self._displayed_media_path[role] = None
+            return
+
+        path = item['path']
+        self._displayed_media_path[role] = path
+
+        if item['is_video']:
+            self._start_video_playback(role, path)
+        else:
+            img = self.load_image(path, 250, 200)
+            if img:
+                label.config(image=img, text='', fg='#ffffff')
+                label.image = img
+            else:
+                label.config(text="❌ Не загружено", image='', fg='#ff6666')
+                label.image = None
+
+    # ------------------------------------------------------------
+    # ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ
+    # ------------------------------------------------------------
+    def _truncate_name(self, text, max_chars=34):
+        if len(text) <= max_chars:
+            return text
+        return text[:max_chars - 1].rstrip() + '…'
+
     def load_config(self):
         if os.path.exists(self.ini_path):
             try:
@@ -111,7 +361,8 @@ class SwitchMenu:
         self.config['Settings'] = {
             'auto_scan': 'True',
             'last_path': '',
-            'slide_interval': '3000'
+            'slide_interval': '3000',
+            'play_video_full': 'False'
         }
         self.save_config()
         print(f"📁 Создан новый файл настроек: {self.ini_path}")
@@ -174,9 +425,38 @@ class SwitchMenu:
     def on_resize(self, event):
         if event.widget == self.root:
             self.draw_background()
+
+    def on_layout_resize(self, event):
+        if self._layout_resize_job:
+            self.root.after_cancel(self._layout_resize_job)
+        self._layout_resize_job = self.root.after(60, self._apply_layout, event.width, event.height)
+
+    def _apply_layout(self, canvas_w, canvas_h):
+        self._layout_resize_job = None
+
+        m = self.LAYOUT_MARGIN
+        content_w = max(canvas_w - m * 2, self.LAYOUT_MIN_LIST_W + self.LAYOUT_MIN_DESC_W + self.LAYOUT_GAP)
+
+        list_w = int(content_w * self.LAYOUT_LIST_RATIO)
+        list_w = max(list_w, self.LAYOUT_MIN_LIST_W)
+        desc_w = content_w - list_w - self.LAYOUT_GAP
+        if desc_w < self.LAYOUT_MIN_DESC_W:
+            desc_w = self.LAYOUT_MIN_DESC_W
+            list_w = content_w - desc_w - self.LAYOUT_GAP
+
+        panel_h = max(canvas_h - 145 - m, self.LAYOUT_MIN_PANEL_H)
+
+        self.canvas.itemconfig(self.header_window, width=content_w)
+        self.canvas.itemconfig(self.btn_window, width=content_w)
+
+        self.canvas.itemconfig(self.list_window, width=list_w, height=panel_h)
+
+        desc_x = m + list_w + self.LAYOUT_GAP
+        self.canvas.coords(self.status_window, desc_x, 115)
+        self.canvas.coords(self.desc_window, desc_x, 145)
+        self.canvas.itemconfig(self.desc_window, width=desc_w, height=panel_h)
     
     def start_title_scroll(self):
-        """Запускает бегущую строку для названия игры"""
         text = self.game_title_label.cget('text')
         if len(text) > 25:
             text = text + '    ' + text + '    ' + text
@@ -185,7 +465,6 @@ class SwitchMenu:
             self.scroll_title()
     
     def scroll_title(self):
-        """Анимирует бегущую строку"""
         if not hasattr(self, 'title_scroll_text') or not self.title_scroll_text:
             return
         
@@ -209,7 +488,6 @@ class SwitchMenu:
         self.title_scroll_timer = self.root.after(200, self.scroll_title)
     
     def stop_title_scroll(self):
-        """Останавливает бегущую строку"""
         if self.title_scroll_timer:
             try:
                 self.root.after_cancel(self.title_scroll_timer)
@@ -219,9 +497,20 @@ class SwitchMenu:
         self.title_scroll_text = None
     
     def create_widgets(self):
+        self.LAYOUT_MARGIN = 20
+        self.LAYOUT_LIST_RATIO = 0.35
+        self.LAYOUT_GAP = 10
+        self.LAYOUT_MIN_LIST_W = 260
+        self.LAYOUT_MIN_DESC_W = 320
+        self.LAYOUT_MIN_PANEL_H = 220
+
+        init_content_w = 1200 - self.LAYOUT_MARGIN * 2
+
         # === ВЕРХНЯЯ ПАНЕЛЬ ===
         header = tk.Frame(self.canvas, bg='#1a1a2e')
-        header_window = self.canvas.create_window(20, 15, anchor='nw', window=header, tags="widgets")
+        self.header_window = self.canvas.create_window(20, 15, anchor='nw',
+                                                         width=init_content_w,
+                                                         window=header, tags="widgets")
         
         title = tk.Label(header, text="🎮 Игры Switch", 
                          font=('Segoe UI', 20, 'bold'), 
@@ -236,9 +525,11 @@ class SwitchMenu:
                                  command=self.show_settings)
         settings_btn.pack(side='right')
         
-        # === КНОПКИ (под заголовком, между "Игры Switch" и "Нажмите на игру") ===
+        # === КНОПКИ ===
         btn_frame = tk.Frame(self.canvas, bg='#1a1a2e')
-        btn_window = self.canvas.create_window(20, 65, anchor='nw', window=btn_frame, tags="widgets")
+        self.btn_window = self.canvas.create_window(20, 65, anchor='nw',
+                                                      width=init_content_w,
+                                                      window=btn_frame, tags="widgets")
         
         self.refresh_btn = tk.Button(btn_frame, text="🔄 Обновить", 
                                      font=('Segoe UI', 11),
@@ -254,7 +545,7 @@ class SwitchMenu:
                                    fg='#888888', bg='#1a1a2e')
         self.path_label.pack(side='right', padx=10)
         
-        # === ИНФОРМАЦИОННАЯ СТРОКА (Нажмите на игру...) ===
+        # === ИНФОРМАЦИОННАЯ СТРОКА ===
         info = tk.Label(self.canvas, 
                         text="📂 Нажмите на игру → описание появится справа", 
                         font=('Segoe UI', 11),
@@ -265,16 +556,16 @@ class SwitchMenu:
         list_frame = tk.Frame(self.canvas, bg='#2d2d44')
         list_frame.pack_propagate(False)
         
-        init_width = int(1200 * 0.35)
+        init_width = int(init_content_w * self.LAYOUT_LIST_RATIO)
         init_height = 500
         
         self.list_window = self.canvas.create_window(20, 145, anchor='nw', 
                                                  width=init_width, height=init_height,
                                                  window=list_frame, tags="widgets")
         
-        # === СЧЁТЧИК И СТАТУС (НАД ПРАВОЙ ПАНЕЛЬЮ, ПО ЕЁ ЛЕВОМУ КРАЮ) ===
+        # === СЧЁТЧИК И СТАТУС ===
         status_frame = tk.Frame(self.canvas, bg='#1a1a2e')
-        status_window = self.canvas.create_window(init_width + 30, 115, anchor='nw', 
+        self.status_window = self.canvas.create_window(init_width + 30, 115, anchor='nw', 
                                                    window=status_frame, tags="widgets")
         
         self.count_label = tk.Label(status_frame, 
@@ -315,8 +606,8 @@ class SwitchMenu:
             tip.configure(bg='#1a1a2e', bd=1, relief='solid')
             
             text = """🔵 = описание (клик для редактирования)
-🟢 = обложка (клик для замены)
-🟡 = геймплей (клик для добавления)"""
+🟢 = обложка (клик — добавить фото/видео)
+🟡 = геймплей (клик — добавить фото/видео)"""
             
             lbl = tk.Label(tip, text=text, 
                           font=('Segoe UI', 9),
@@ -349,8 +640,12 @@ class SwitchMenu:
             lambda e: self.list_canvas.configure(scrollregion=self.list_canvas.bbox("all"))
         )
         
-        self.list_canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
+        self.list_canvas_window = self.list_canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
         self.list_canvas.configure(yscrollcommand=scrollbar.set)
+
+        def _on_list_canvas_configure(event):
+            self.list_canvas.itemconfig(self.list_canvas_window, width=event.width)
+        self.list_canvas.bind('<Configure>', _on_list_canvas_configure)
         
         self.list_canvas.pack(side='left', fill='both', expand=True)
         scrollbar.pack(side='right', fill='y')
@@ -366,7 +661,7 @@ class SwitchMenu:
         desc_frame = tk.Frame(self.canvas, bg='#2d2d44')
         desc_frame.pack_propagate(False)
         
-        desc_width = int(1200 * 0.60) - 20
+        desc_width = init_content_w - init_width - self.LAYOUT_GAP
         desc_height = 500
         
         self.desc_window = self.canvas.create_window(init_width + 30, 145, anchor='nw',
@@ -378,14 +673,12 @@ class SwitchMenu:
         top_row = tk.Frame(desc_frame, bg='#2d2d44')
         top_row.pack(fill='x', pady=(5, 5), padx=(10, 10))
         
-        # Название игры (с бегущей строкой)
         self.game_title_label = tk.Label(top_row, 
                                          text="Выберите игру", 
                                          font=('Segoe UI', 14, 'bold'),
                                          fg='#8aadff', bg='#2d2d44')
         self.game_title_label.pack(side='left')
         
-        # Кнопка "Открыть папку" (справа)
         self.open_folder_btn = tk.Button(top_row, 
                                          text="📂 Открыть папку", 
                                          font=('Segoe UI', 10, 'bold'),
@@ -400,7 +693,6 @@ class SwitchMenu:
                                          command=self.open_current_folder)
         self.open_folder_btn.pack(side='right')
         
-        # Эффект при наведении на кнопку
         def on_open_enter(e):
             if self.open_folder_btn['state'] != 'disabled':
                 e.widget.configure(bg='#5a7a9a')
@@ -431,8 +723,10 @@ class SwitchMenu:
                                     fg='#888888',
                                     cursor='hand2')
         self.cover_label.pack(padx=5, pady=(0, 5))
-        self.cover_label.bind('<Enter>', self.show_cover_tip)
-        self.cover_label.bind('<Leave>', self.hide_tip)
+        self.cover_label.bind('<Enter>', lambda e: self.on_media_enter('cover', e))
+        self.cover_label.bind('<Leave>', lambda e: self.on_media_leave('cover', e))
+        self.cover_label.bind('<MouseWheel>', lambda e: self.on_media_scroll('cover', e))
+        self.cover_label.bind('<Button-1>', lambda e: self.on_media_click('cover', e))
         
         # Геймплей
         gameplay_frame = tk.Frame(images_frame, bg='#1a1a2e', bd=1, relief='solid')
@@ -451,11 +745,10 @@ class SwitchMenu:
                                        cursor='hand2')
         self.gameplay_label.pack(padx=5, pady=(0, 5))
         
-        self.gameplay_label.bind('<Enter>', self.on_gameplay_enter)
-        self.gameplay_label.bind('<Leave>', self.on_gameplay_leave)
-        self.gameplay_label.bind('<MouseWheel>', self.on_gameplay_scroll)
-        self.gameplay_label.bind('<Enter>', self.show_gameplay_tip)
-        self.gameplay_label.bind('<Leave>', self.hide_tip)
+        self.gameplay_label.bind('<Enter>', lambda e: self.on_media_enter('gameplay', e))
+        self.gameplay_label.bind('<Leave>', lambda e: self.on_media_leave('gameplay', e))
+        self.gameplay_label.bind('<MouseWheel>', lambda e: self.on_media_scroll('gameplay', e))
+        self.gameplay_label.bind('<Button-1>', lambda e: self.on_media_click('gameplay', e))
         
         # Текст описания
         desc_text_frame = tk.Frame(desc_frame, bg='#2d2d44')
@@ -499,6 +792,9 @@ class SwitchMenu:
         settings_btn.bind('<Enter>', on_settings_enter)
         settings_btn.bind('<Leave>', on_settings_leave)
     
+    # ------------------------------------------------------------
+    # ПОДСКАЗКИ И РЕДАКТИРОВАНИЕ ОПИСАНИЯ
+    # ------------------------------------------------------------
     def show_desc_tip(self, event):
         if not self.current_desc_path:
             self.show_info_tip(event, 
@@ -509,22 +805,26 @@ class SwitchMenu:
                 "3. Нажмите 'Сохранить'")
     
     def show_cover_tip(self, event):
-        if not self.current_cover_path:
+        if not self.current_media['cover']:
             self.show_info_tip(event, 
                 "📖 Обложка отсутствует\n\n"
                 "Как добавить:\n"
                 "1. Нажмите 🟢 зелёный индикатор\n"
-                "2. Выберите изображение\n"
-                "3. Обложка автоматически обновится")
+                "2. Выберите фото или видео\n"
+                "3. Можно добавить несколько — колесо мыши переключает\n"
+                "4. Клик по видео открывает его в плеере\n"
+                "   (для изображений — в просмотрщике)")
     
     def show_gameplay_tip(self, event):
-        if not self.current_gameplay_paths:
+        if not self.current_media['gameplay']:
             self.show_info_tip(event, 
                 "🎮 Геймплей отсутствует\n\n"
                 "Как добавить:\n"
                 "1. Нажмите 🟡 жёлтый индикатор\n"
-                "2. Выберите изображение\n"
-                "3. Картинка добавится как gameX.jpg")
+                "2. Выберите фото или видео\n"
+                "3. Можно добавить несколько — колесо мыши переключает\n"
+                "4. Клик по видео открывает его в плеере\n"
+                "   (для изображений — в просмотрщике)")
     
     def show_info_tip(self, event, text):
         widget = event.widget
@@ -612,7 +912,8 @@ class SwitchMenu:
                 self.current_desc_path = desc_path
                 self.load_games()
                 self.show_game_description(game, desc_path, 
-                                          self.current_cover_path, self.current_gameplay_paths)
+                                          self.current_media['cover'], self.current_media['gameplay'],
+                                          delay=0)
             except Exception as e:
                 messagebox.showerror("Ошибка", f"Не удалось сохранить: {e}")
         
@@ -632,82 +933,98 @@ class SwitchMenu:
                   relief='flat', cursor='hand2',
                   command=edit_window.destroy).pack(side='left')
     
+    # ------------------------------------------------------------
+    # РАБОТА С МЕДИА-ФАЙЛАМИ
+    # ------------------------------------------------------------
+    def _add_media_file(self, prefix, dialog_title):
+        file_path = filedialog.askopenfilename(
+            title=dialog_title,
+            filetypes=[
+                ("Фото и видео", "*.jpg *.jpeg *.png *.bmp *.gif *.webp *.mp4 *.mkv *.avi *.mov *.webm *.wmv *.m4v"),
+                ("Изображения", "*.jpg *.jpeg *.png *.bmp *.gif *.webp"),
+                ("Видео", "*.mp4 *.mkv *.avi *.mov *.webm *.wmv *.m4v"),
+            ]
+        )
+        if not file_path:
+            return None
+        return file_path
+
     def choose_cover(self, game):
+        self.add_cover(game)
+
+    def add_cover(self, game):
         if not game:
             return
         
-        file_path = filedialog.askopenfilename(
-            title="Выберите изображение для обложки",
-            filetypes=[("Изображения", "*.jpg *.jpeg *.png *.bmp *.gif *.webp")]
-        )
-        
+        file_path = self._add_media_file('cover', "Выберите обложку (фото или видео)")
         if not file_path:
             return
         
         game_path = os.path.join(self.switch_path, game)
-        ext = os.path.splitext(file_path)[1]
-        cover_path = os.path.join(game_path, f'cover{ext}')
+        new_path = self._copy_as_next_numbered(file_path, game_path, 'cover')
+        if not new_path:
+            return
         
-        try:
-            for f in os.listdir(game_path):
-                if f.lower().startswith('cover') and self.is_image_file(f):
-                    os.remove(os.path.join(game_path, f))
-            
-            shutil.copy2(file_path, cover_path)
-            messagebox.showinfo("Успех", "Обложка обновлена!")
-            self.current_cover_path = cover_path
-            self.load_games()
-            _, _, gameplay_files = self.find_game_files(game_path)
-            self.show_game_description(game, self.current_desc_path,
-                                      cover_path, gameplay_files)
-        except Exception as e:
-            messagebox.showerror("Ошибка", f"Не удалось сохранить обложку: {e}")
+        messagebox.showinfo("Успех", f"Обложка добавлена: {os.path.basename(new_path)}")
+        self.load_games()
+        _, cover_media, gameplay_media = self.find_game_files(game_path)
+        self.show_game_description(game, self.current_desc_path, cover_media, gameplay_media, delay=0)
     
     def add_gameplay(self, game):
         if not game:
             return
         
-        file_path = filedialog.askopenfilename(
-            title="Выберите изображение для геймплея",
-            filetypes=[("Изображения", "*.jpg *.jpeg *.png *.bmp *.gif *.webp")]
-        )
-        
+        file_path = self._add_media_file('game', "Выберите геймплей (фото или видео)")
         if not file_path:
             return
         
         game_path = os.path.join(self.switch_path, game)
+        new_path = self._copy_as_next_numbered(file_path, game_path, 'game')
+        if not new_path:
+            return
         
+        messagebox.showinfo("Успех", f"Геймплей добавлен: {os.path.basename(new_path)}")
+        self.load_games()
+        _, cover_media, gameplay_media = self.find_game_files(game_path)
+        self.show_game_description(game, self.current_desc_path, cover_media, gameplay_media, delay=0)
+    
+    def _copy_as_next_numbered(self, file_path, game_path, prefix):
         existing = []
-        for f in os.listdir(game_path):
-            if f.lower().startswith('game') and self.is_image_file(f):
-                try:
-                    num = int(''.join(filter(str.isdigit, f)))
-                    existing.append(num)
-                except:
-                    pass
+        try:
+            for f in os.listdir(game_path):
+                if f.lower().startswith(prefix) and self.is_media_file(f):
+                    try:
+                        num = int(''.join(filter(str.isdigit, f)))
+                        existing.append(num)
+                    except:
+                        pass
+        except Exception:
+            pass
         
         next_num = max(existing) + 1 if existing else 1
         ext = os.path.splitext(file_path)[1]
-        new_path = os.path.join(game_path, f'game{next_num}{ext}')
+        new_path = os.path.join(game_path, f'{prefix}{next_num}{ext}')
         
         try:
             shutil.copy2(file_path, new_path)
-            messagebox.showinfo("Успех", f"Геймплей добавлен как game{next_num}{ext}")
-            self.load_games()
-            _, _, gameplay_files = self.find_game_files(game_path)
-            self.current_gameplay_paths = gameplay_files
-            self.show_game_description(game, self.current_desc_path,
-                                      self.current_cover_path, gameplay_files)
+            return new_path
         except Exception as e:
-            messagebox.showerror("Ошибка", f"Не удалось добавить геймплей: {e}")
+            messagebox.showerror("Ошибка", f"Не удалось добавить файл: {e}")
+            return None
     
     def is_image_file(self, filename):
         return filename.lower().endswith(IMAGE_EXTENSIONS)
     
+    def is_video_file(self, filename):
+        return filename.lower().endswith(VIDEO_EXTENSIONS)
+    
+    def is_media_file(self, filename):
+        return self.is_image_file(filename) or self.is_video_file(filename)
+    
     def find_game_files(self, game_path):
         desc_file = None
-        cover_file = None
-        gameplay_files = []
+        cover_paths = []
+        gameplay_paths = []
         
         try:
             for file in os.listdir(game_path):
@@ -719,15 +1036,20 @@ class SwitchMenu:
                 
                 if file_lower == 'description.txt':
                     desc_file = full_path
-                elif file_lower.startswith('cover') and self.is_image_file(file):
-                    cover_file = full_path
-                elif file_lower.startswith('game') and self.is_image_file(file):
-                    gameplay_files.append(full_path)
+                elif file_lower.startswith('cover') and self.is_media_file(file):
+                    cover_paths.append(full_path)
+                elif file_lower.startswith('game') and self.is_media_file(file):
+                    gameplay_paths.append(full_path)
         except:
             pass
         
-        gameplay_files.sort()
-        return desc_file, cover_file, gameplay_files
+        cover_paths.sort()
+        gameplay_paths.sort()
+        
+        cover_media = [{'path': p, 'is_video': self.is_video_file(p)} for p in cover_paths]
+        gameplay_media = [{'path': p, 'is_video': self.is_video_file(p)} for p in gameplay_paths]
+        
+        return desc_file, cover_media, gameplay_media
     
     def read_text_file(self, file_path):
         try:
@@ -764,12 +1086,15 @@ class SwitchMenu:
             print(f"Ошибка загрузки {file_path}: {e}")
             return None
     
+    # ------------------------------------------------------------
+    # НАСТРОЙКИ
+    # ------------------------------------------------------------
     def show_settings(self):
         print("⚙️ Открываем окно настроек")
         
         settings_window = tk.Toplevel(self.root)
         settings_window.title("Настройки")
-        settings_window.geometry("500x520")
+        settings_window.geometry("500x600")
         settings_window.configure(bg='#2d2d44')
         settings_window.resizable(False, False)
         
@@ -848,7 +1173,7 @@ class SwitchMenu:
                        variable=auto_scan_var,
                        font=('Segoe UI', 11),
                        fg='#cccccc', bg='#2d2d44',
-                       selectcolor='#2d2d44',
+                       selectcolor='#4a4a6a',
                        activebackground='#2d2d44',
                        activeforeground='#ffffff',
                        command=on_auto_changed).pack(anchor='w')
@@ -856,7 +1181,7 @@ class SwitchMenu:
         tk.Frame(main_frame, bg='#4a4a6a', height=1).pack(fill='x', pady=10)
         
         tk.Label(main_frame, 
-                 text="🔄 Частота смены геймплей-картинок (мс):", 
+                 text="🔄 Частота смены обложек и геймплей-картинок (мс):", 
                  font=('Segoe UI', 11),
                  fg='#cccccc', bg='#2d2d44').pack(anchor='w')
         
@@ -875,6 +1200,25 @@ class SwitchMenu:
                  text="(500 - 10000 мс)", 
                  font=('Segoe UI', 9),
                  fg='#666666', bg='#2d2d44').pack(anchor='w')
+        
+        play_video_full_var = tk.BooleanVar(value=self.play_video_full)
+        
+        def on_video_full_changed():
+            self.config['Settings']['play_video_full'] = str(play_video_full_var.get())
+            self.save_config()
+        
+        video_cb = tk.Checkbutton(main_frame, 
+                                  text="▶️ Воспроизводить видео до конца (игнорировать таймер слайд-шоу)", 
+                                  variable=play_video_full_var,
+                                  font=('Segoe UI', 11),
+                                  fg='#cccccc', bg='#2d2d44',
+                                  selectcolor='#4a4a6a',
+                                  activebackground='#2d2d44',
+                                  activeforeground='#ffffff',
+                                  wraplength=380,
+                                  justify='left',
+                                  command=on_video_full_changed)
+        video_cb.pack(anchor='w', pady=(5, 0))
         
         tk.Frame(main_frame, bg='#4a4a6a', height=1).pack(fill='x', pady=10)
         
@@ -931,7 +1275,7 @@ class SwitchMenu:
                 placeholder.pack(padx=8, pady=8)
             
             info_text = """Создал: Шувалов Павел Витальевич
-Дата: 03.07.2026г.
+Дата: 14.07.2026г. v_1.1
 
 Программа для удобного просмотра
 игр Nintendo Switch с описаниями."""
@@ -999,11 +1343,14 @@ class SwitchMenu:
                 
                 self.slide_interval = new_interval
                 self.config['Settings']['slide_interval'] = str(new_interval)
+                self.play_video_full = play_video_full_var.get()
+                self.config['Settings']['play_video_full'] = str(self.play_video_full)
                 self.save_config()
                 
-                if self.gameplay_images:
-                    self.stop_slideshow()
-                    self.start_slideshow()
+                for role in ('cover', 'gameplay'):
+                    if len(self.current_media.get(role, [])) > 1:
+                        self.stop_slideshow(role)
+                        self.start_slideshow(role)
                 
                 settings_window.destroy()
                 self.load_games()
@@ -1040,58 +1387,85 @@ class SwitchMenu:
         y = (settings_window.winfo_screenheight() // 2) - (height // 2)
         settings_window.geometry(f"{width}x{height}+{x}+{y}")
     
-    def on_gameplay_enter(self, event):
-        self.is_hovering_gameplay = True
-        self.stop_slideshow()
+    # ------------------------------------------------------------
+    # МЕДИА СОБЫТИЯ (наведение, скролл, клик)
+    # ------------------------------------------------------------
+    def on_media_enter(self, role, event):
+        self.slides[role]['is_hovering'] = True
+        self.stop_slideshow(role)
+        if role == 'cover':
+            self.show_cover_tip(event)
+        else:
+            self.show_gameplay_tip(event)
     
-    def on_gameplay_leave(self, event):
-        self.is_hovering_gameplay = False
-        if len(self.gameplay_images) > 1:
-            self.start_slideshow()
+    def on_media_leave(self, role, event):
+        self.slides[role]['is_hovering'] = False
+        if len(self.current_media.get(role, [])) > 1:
+            self.start_slideshow(role)
+        self.hide_tip(event)
     
-    def on_gameplay_scroll(self, event):
-        if len(self.gameplay_images) <= 1:
+    def on_media_scroll(self, role, event):
+        items = self.current_media.get(role, [])
+        if len(items) <= 1:
             return
+        idx = self.slides[role]['index']
         if event.delta > 0:
-            self.gameplay_index = (self.gameplay_index - 1) % len(self.gameplay_images)
+            idx = (idx - 1) % len(items)
         else:
-            self.gameplay_index = (self.gameplay_index + 1) % len(self.gameplay_images)
-        self.show_gameplay_at_index(self.gameplay_index)
+            idx = (idx + 1) % len(items)
+        self.slides[role]['index'] = idx
+        self.render_media(role, items[idx])
     
-    def start_slideshow(self):
-        if len(self.gameplay_images) <= 1 or self.is_hovering_gameplay:
+    def on_media_click(self, role, event):
+        path = self._displayed_media_path.get(role)
+        if path:
+            try:
+                os.startfile(path)
+            except Exception as e:
+                messagebox.showerror("Ошибка", f"Не удалось открыть файл:\n{path}\n\n{str(e)}")
+    
+    # ------------------------------------------------------------
+    # СЛАЙД-ШОУ
+    # ------------------------------------------------------------
+    def start_slideshow(self, role):
+        items = self.current_media.get(role, [])
+        if len(items) <= 1 or self.slides[role]['is_hovering']:
             return
-        self.is_sliding = True
-        self.next_slide()
+        self.slides[role]['is_sliding'] = True
+        self.next_slide(role)
     
-    def next_slide(self):
-        if not self.is_sliding or self.is_hovering_gameplay or len(self.gameplay_images) <= 1:
+    def next_slide(self, role):
+        st = self.slides[role]
+        items = self.current_media.get(role, [])
+        if not st['is_sliding'] or st['is_hovering'] or len(items) <= 1:
             return
-        self.gameplay_index = (self.gameplay_index + 1) % len(self.gameplay_images)
-        self.show_gameplay_at_index(self.gameplay_index)
-        self.slide_timer = self.root.after(self.slide_interval, self.next_slide)
+        
+        if self.play_video_full:
+            player = self.video_players.get(role)
+            if player and player['running']:
+                st['timer'] = self.root.after(self.slide_interval, self.next_slide, role)
+                return
+        
+        st['index'] = (st['index'] + 1) % len(items)
+        self.render_media(role, items[st['index']])
+        st['timer'] = self.root.after(self.slide_interval, self.next_slide, role)
     
-    def stop_slideshow(self):
-        self.is_sliding = False
-        if self.slide_timer:
-            self.root.after_cancel(self.slide_timer)
-            self.slide_timer = None
+    def stop_slideshow(self, role):
+        st = self.slides[role]
+        st['is_sliding'] = False
+        if st['timer']:
+            self.root.after_cancel(st['timer'])
+            st['timer'] = None
     
-    def show_gameplay_at_index(self, index):
-        if not self.gameplay_images or index >= len(self.gameplay_images):
-            return
-        img = self.load_image(self.gameplay_images[index], 250, 200)
-        if img:
-            self.gameplay_label.config(image=img)
-            self.gameplay_label.image = img
-        else:
-            self.gameplay_label.config(text="Геймплей отсутствует", image='', fg='#888888')
-    
+    # ------------------------------------------------------------
+    # ОСНОВНАЯ ЛОГИКА ЗАГРУЗКИ И ОТОБРАЖЕНИЯ
+    # ------------------------------------------------------------
     def auto_start(self):
         print("🚀 Автозапуск...")
         auto_scan = self.config.getboolean('Settings', 'auto_scan', fallback=True)
         last_path = self.config.get('Settings', 'last_path', fallback='')
         self.slide_interval = self.config.getint('Settings', 'slide_interval', fallback=3000)
+        self.play_video_full = self.config.getboolean('Settings', 'play_video_full', fallback=False)
         
         if last_path and os.path.exists(last_path):
             self.switch_path = last_path
@@ -1114,6 +1488,10 @@ class SwitchMenu:
         self.show_empty("😕 Папка не выбрана\n\nНажмите ⚙️ Настройки → Выбрать папку")
     
     def load_games(self):
+        if self._update_job:
+            self.root.after_cancel(self._update_job)
+            self._update_job = None
+        
         if not self.switch_path:
             self.show_empty("😕 Папка не выбрана\n\nНажмите ⚙️ Настройки → Выбрать папку")
             self.count_label.config(text="0 игр")
@@ -1150,6 +1528,15 @@ class SwitchMenu:
             self.games = sorted(folders)
             self.show_games()
             self.status_label.config(text=f"✅ Найдено {len(self.games)} игр")
+            
+            if self.selected_index >= len(self.games):
+                self.selected_index = -1
+            if self.selected_index == -1 and self.games:
+                self.selected_index = 0
+                self.select_game(0)
+            elif self.selected_index >= 0:
+                self.select_game(self.selected_index)
+                
         except Exception as e:
             self.show_empty(f"❌ Ошибка: {str(e)}")
             self.count_label.config(text="0 игр")
@@ -1158,136 +1545,146 @@ class SwitchMenu:
     def show_games(self):
         self.count_label.config(text=f"{len(self.games)} игр")
         
-        for game in self.games:
+        for i, game in enumerate(self.games):
             frame = tk.Frame(self.scrollable_frame, bg='#3a3a55', bd=0, relief='flat')
-            frame.pack(fill='x', pady=2, padx=2)
-            
+            frame.pack(fill='x', pady=1, padx=2)
+            frame.game_name = game
+            frame.index = i
+
             def on_item_mousewheel(event, canvas=self.list_canvas):
                 canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
                 return "break"
             frame.bind('<MouseWheel>', on_item_mousewheel)
-            
+
             indicators_left = tk.Frame(frame, bg='#3a3a55')
-            indicators_left.pack(side='left', padx=(4, 6), pady=2)
-            
+            indicators_left.pack(side='right', padx=(6, 4), pady=1)
+
             game_path = os.path.join(self.switch_path, game)
-            desc_file, cover_file, gameplay_files = self.find_game_files(game_path)
+            desc_file, cover_media, gameplay_media = self.find_game_files(game_path)
             has_desc = desc_file is not None
-            has_cover = cover_file is not None
-            has_gameplay = len(gameplay_files) > 0
-            
+            has_cover = len(cover_media) > 0
+            has_gameplay = len(gameplay_media) > 0
+
             def create_indicator(parent, color, active, tooltip_text, action, game_name):
-                ind_frame = tk.Frame(parent, bg=color if active else '#3d3d5c', 
-                                     width=14, height=14, bd=1, relief='solid')
-                ind_frame.pack(side='top', pady=1)
+                ind_frame = tk.Frame(parent, bg=color if active else '#3d3d5c',
+                                     width=12, height=12, bd=1, relief='solid')
+                ind_frame.pack(side='left', padx=2)
                 ind_frame.pack_propagate(False)
-                
-                dot = tk.Label(ind_frame, text="", 
+
+                dot = tk.Label(ind_frame, text="",
                                bg=color if active else '#3d3d5c')
                 dot.pack(fill='both', expand=True)
-                
+
                 ind_frame.configure(cursor='hand2')
-                
+
                 def on_enter(e):
                     tip = tk.Toplevel(ind_frame)
                     tip.overrideredirect(True)
                     tip.configure(bg='#1a1a2e', bd=1, relief='solid')
-                    
                     status_text = "✅" if active else "❌"
-                    lbl = tk.Label(tip, text=f"{tooltip_text} {status_text}\n(клик для редактирования)", 
+                    lbl = tk.Label(tip, text=f"{tooltip_text} {status_text}\n(клик для редактирования)",
                                    font=('Segoe UI', 8),
                                    fg='#cccccc', bg='#1a1a2e',
                                    padx=8, pady=4, justify='left')
                     lbl.pack()
-                    
                     x = ind_frame.winfo_rootx()
                     y = ind_frame.winfo_rooty() - 38
                     tip.wm_geometry(f"+{x}+{y}")
                     ind_frame.tip = tip
-                
+
                 def on_leave(e):
                     if hasattr(ind_frame, 'tip'):
                         ind_frame.tip.destroy()
                         del ind_frame.tip
-                
+
                 def on_click(e):
                     action(game_name)
-                
+
                 ind_frame.bind('<Enter>', on_enter)
                 ind_frame.bind('<Leave>', on_leave)
                 ind_frame.bind('<Button-1>', on_click)
                 dot.bind('<Button-1>', on_click)
-                
                 return ind_frame
-            
-            create_indicator(indicators_left, '#4a8af4', has_desc, 
+
+            create_indicator(indicators_left, '#4a8af4', has_desc,
                             "📝 Описание", self.edit_description, game)
-            create_indicator(indicators_left, '#4aca4a', has_cover, 
-                            "📖 Обложка", self.choose_cover, game)
-            create_indicator(indicators_left, '#e8a830', has_gameplay, 
+            create_indicator(indicators_left, '#4aca4a', has_cover,
+                            "📖 Обложка", self.add_cover, game)
+            create_indicator(indicators_left, '#e8a830', has_gameplay,
                             "🎮 Геймплей", self.add_gameplay, game)
-            
-            name_label = tk.Label(frame, text=game, 
-                                  font=('Segoe UI', 13),
+
+            name_label = tk.Label(frame, text=self._truncate_name(game),
+                                  font=('Segoe UI', 11),
                                   fg='#ffffff', bg='#3a3a55',
-                                  cursor='hand2')
-            name_label.pack(side='left', padx=(5, 0), pady=8)
+                                  cursor='hand2', anchor='w')
+            name_label.pack(side='left', padx=(5, 0), pady=2, fill='x', expand=True)
             name_label.bind('<MouseWheel>', on_item_mousewheel)
-            
+
             frame.desc_file = desc_file
-            frame.cover_file = cover_file
-            frame.gameplay_files = gameplay_files
+            frame.cover_media = cover_media
+            frame.gameplay_media = gameplay_media
             
-            def on_click(e, g=game, df=desc_file, cf=cover_file, gf=gameplay_files):
-                self.show_game_description(g, df, cf, gf)
+            def on_click(e, g=game, idx=i, df=desc_file, cm=cover_media, gm=gameplay_media):
+                self.selected_index = idx
+                self.highlight_game(g)
+                self.scroll_to_index(idx)
+                self.show_game_description(g, df, cm, gm, delay=300)
             
             frame.bind('<Button-1>', on_click)
             name_label.bind('<Button-1>', on_click)
     
-    def show_game_description(self, game, desc_file, cover_file, gameplay_files):
+    def highlight_game(self, game_name):
+        for child in self.scrollable_frame.winfo_children():
+            if hasattr(child, 'game_name'):
+                if child.game_name == game_name:
+                    child.config(bg='#4a6a8a')
+                else:
+                    child.config(bg='#3a3a55')
+    
+    def show_game_description(self, game, desc_file, cover_media, gameplay_media, delay=300):
+        if self._update_job:
+            self.root.after_cancel(self._update_job)
+            self._update_job = None
+        
+        if delay > 0:
+            self._update_job = self.root.after(delay, self._do_show_game_description,
+                                               game, desc_file, cover_media, gameplay_media)
+        else:
+            self._do_show_game_description(game, desc_file, cover_media, gameplay_media)
+    
+    def _do_show_game_description(self, game, desc_file, cover_media, gameplay_media):
+        self._update_job = None
+        
         self.current_game = game
         self.current_desc_path = desc_file
-        self.current_cover_path = cover_file
-        self.current_gameplay_paths = gameplay_files
+        self.current_media['cover'] = cover_media or []
+        self.current_media['gameplay'] = gameplay_media or []
         
-        # Останавливаем старую анимацию
         self.stop_title_scroll()
+        self._stop_all_video()
         
-        # Обновляем название
         self.game_title_label.config(text=game)
         self.open_folder_btn.config(state='normal')
         
-        # Запускаем бегущую строку, если название длинное
         if len(game) > 25:
             self.root.after(500, self.start_title_scroll)
         else:
             self.game_title_label.config(text=game)
         
-        self.stop_slideshow()
-        self.gameplay_images = []
-        self.gameplay_index = 0
+        for role in ('cover', 'gameplay'):
+            self.stop_slideshow(role)
+            self.slides[role]['index'] = 0
         
-        # Обложка
-        if cover_file:
-            img = self.load_image(cover_file, 250, 200)
-            if img:
-                self.cover_label.config(image=img, text="", fg='#ffffff')
-                self.cover_label.image = img
-            else:
-                self.cover_label.config(text="❌ Не загружено", image='', fg='#ff6666')
-        else:
-            self.cover_label.config(text="📖 Обложка отсутствует", image='', fg='#888888')
+        cover_items = self.current_media['cover']
+        self.render_media('cover', cover_items[0] if cover_items else None)
+        if len(cover_items) > 1:
+            self.start_slideshow('cover')
         
-        # Геймплей
-        if gameplay_files:
-            self.gameplay_images = gameplay_files
-            self.show_gameplay_at_index(0)
-            if len(gameplay_files) > 1:
-                self.start_slideshow()
-        else:
-            self.gameplay_label.config(text="🎮 Геймплей отсутствует", image='', fg='#888888')
+        gameplay_items = self.current_media['gameplay']
+        self.render_media('gameplay', gameplay_items[0] if gameplay_items else None)
+        if len(gameplay_items) > 1:
+            self.start_slideshow('gameplay')
         
-        # Описание
         if desc_file:
             text = self.read_text_file(desc_file)
             self.desc_text.delete('1.0', tk.END)
@@ -1302,6 +1699,9 @@ class SwitchMenu:
                                          fg='#888888', cursor='hand2')
             self.desc_status_label.bind('<Enter>', self.show_desc_tip)
             self.desc_status_label.bind('<Leave>', self.hide_tip)
+        
+        if game:
+            self.highlight_game(game)
     
     def open_current_folder(self):
         if self.current_game:
